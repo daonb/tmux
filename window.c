@@ -495,8 +495,8 @@ window_set_active_pane(struct window *w, struct window_pane *wp, int notify)
 void
 window_redraw_active_switch(struct window *w, struct window_pane *wp)
 {
-	struct style	*sy1, *sy2;
-	int		 c1, c2;
+	struct grid_cell	*gc1, *gc2;
+	int			 c1, c2;
 
 	if (wp == w->active)
 		return;
@@ -506,18 +506,18 @@ window_redraw_active_switch(struct window *w, struct window_pane *wp)
 		 * If the active and inactive styles or palettes are different,
 		 * need to redraw the panes.
 		 */
-		sy1 = &wp->cached_style;
-		sy2 = &wp->cached_active_style;
-		if (!style_equal(sy1, sy2))
+		gc1 = &wp->cached_gc;
+		gc2 = &wp->cached_active_gc;
+		if (!grid_cells_look_equal(gc1, gc2))
 			wp->flags |= PANE_REDRAW;
 		else {
-			c1 = window_pane_get_palette(wp, sy1->gc.fg);
-			c2 = window_pane_get_palette(wp, sy2->gc.fg);
+			c1 = window_pane_get_palette(wp, gc1->fg);
+			c2 = window_pane_get_palette(wp, gc2->fg);
 			if (c1 != c2)
 				wp->flags |= PANE_REDRAW;
 			else {
-				c1 = window_pane_get_palette(wp, sy1->gc.bg);
-				c2 = window_pane_get_palette(wp, sy2->gc.bg);
+				c1 = window_pane_get_palette(wp, gc1->bg);
+				c2 = window_pane_get_palette(wp, gc2->bg);
 				if (c1 != c2)
 					wp->flags |= PANE_REDRAW;
 			}
@@ -872,6 +872,9 @@ window_pane_create(struct window *w, u_int sx, u_int sy, u_int hlimit)
 	wp->fd = -1;
 	wp->event = NULL;
 
+	wp->fg = 8;
+	wp->bg = 8;
+
 	TAILQ_INIT(&wp->modes);
 
 	wp->layout_cell = NULL;
@@ -1003,26 +1006,6 @@ window_pane_resize(struct window_pane *wp, u_int sx, u_int sy)
 }
 
 void
-window_pane_alternate_on(struct window_pane *wp, struct grid_cell *gc,
-    int cursor)
-{
-	if (!options_get_number(wp->options, "alternate-screen"))
-		return;
-	screen_alternate_on(&wp->base, gc, cursor);
-	wp->flags |= PANE_REDRAW;
-}
-
-void
-window_pane_alternate_off(struct window_pane *wp, struct grid_cell *gc,
-    int cursor)
-{
-	if (!options_get_number(wp->options, "alternate-screen"))
-		return;
-	screen_alternate_off(&wp->base, gc, cursor);
-	wp->flags |= PANE_REDRAW;
-}
-
-void
 window_pane_set_palette(struct window_pane *wp, u_int n, int colour)
 {
 	if (n > 0xff)
@@ -1076,39 +1059,15 @@ window_pane_get_palette(struct window_pane *wp, int c)
 	return (new);
 }
 
-static void
-window_pane_mode_timer(__unused int fd, __unused short events, void *arg)
-{
-	struct window_pane	*wp = arg;
-	struct timeval		 tv = { .tv_sec = 10 };
-	int			 n = 0;
-
-	evtimer_del(&wp->modetimer);
-	evtimer_add(&wp->modetimer, &tv);
-
-	log_debug("%%%u in mode: last=%ld", wp->id, (long)wp->modelast);
-
-	if (wp->modelast < time(NULL) - WINDOW_MODE_TIMEOUT) {
-		if (ioctl(wp->fd, FIONREAD, &n) == -1 || n > 0)
-			window_pane_reset_mode_all(wp);
-	}
-}
-
 int
-window_pane_set_mode(struct window_pane *wp, const struct window_mode *mode,
-    struct cmd_find_state *fs, struct args *args)
+window_pane_set_mode(struct window_pane *wp, struct window_pane *swp,
+    const struct window_mode *mode, struct cmd_find_state *fs,
+    struct args *args)
 {
-	struct timeval			 tv = { .tv_sec = 10 };
 	struct window_mode_entry	*wme;
 
 	if (!TAILQ_EMPTY(&wp->modes) && TAILQ_FIRST(&wp->modes)->mode == mode)
 		return (1);
-
-	wp->modelast = time(NULL);
-	if (TAILQ_EMPTY(&wp->modes)) {
-		evtimer_set(&wp->modetimer, window_pane_mode_timer, wp);
-		evtimer_add(&wp->modetimer, &tv);
-	}
 
 	TAILQ_FOREACH(wme, &wp->modes, entry) {
 		if (wme->mode == mode)
@@ -1120,6 +1079,7 @@ window_pane_set_mode(struct window_pane *wp, const struct window_mode *mode,
 	} else {
 		wme = xcalloc(1, sizeof *wme);
 		wme->wp = wp;
+		wme->swp = swp;
 		wme->mode = mode;
 		wme->prefix = 1;
 		TAILQ_INSERT_HEAD(&wp->modes, wme, entry);
@@ -1129,6 +1089,7 @@ window_pane_set_mode(struct window_pane *wp, const struct window_mode *mode,
 	wp->screen = wme->screen;
 	wp->flags |= (PANE_REDRAW|PANE_CHANGED);
 
+	server_redraw_window_borders(wp->window);
 	server_status_window(wp->window);
 	notify_pane("pane-mode-changed", wp);
 
@@ -1151,7 +1112,6 @@ window_pane_reset_mode(struct window_pane *wp)
 	next = TAILQ_FIRST(&wp->modes);
 	if (next == NULL) {
 		log_debug("%s: no next mode", __func__);
-		evtimer_del(&wp->modetimer);
 		wp->screen = &wp->base;
 	} else {
 		log_debug("%s: next mode is %s", __func__, next->mode->name);
@@ -1161,6 +1121,7 @@ window_pane_reset_mode(struct window_pane *wp)
 	}
 	wp->flags |= (PANE_REDRAW|PANE_CHANGED);
 
+	server_redraw_window_borders(wp->window);
 	server_status_window(wp->window);
 	notify_pane("pane-mode-changed", wp);
 }
@@ -1184,8 +1145,7 @@ window_pane_key(struct window_pane *wp, struct client *c, struct session *s,
 
 	wme = TAILQ_FIRST(&wp->modes);
 	if (wme != NULL) {
-		wp->modelast = time(NULL);
-		if (wme->mode->key != NULL)
+		if (wme->mode->key != NULL && c != NULL)
 			wme->mode->key(wme, c, s, wl, (key & ~KEYC_XTERM), m);
 		return (0);
 	}
@@ -1250,7 +1210,7 @@ window_pane_search(struct window_pane *wp, const char *term, int regex,
 		}
 		log_debug("%s: %s", __func__, line);
 		if (!regex)
-			found = (fnmatch(new, line, 0) == 0);
+			found = (fnmatch(new, line, flags) == 0);
 		else
 			found = (regexec(&r, line, 0, NULL, 0) == 0);
 		free(line);
@@ -1571,7 +1531,7 @@ int
 window_pane_start_input(struct window_pane *wp, struct cmdq_item *item,
     char **cause)
 {
-	struct client			*c = item->client;
+	struct client			*c = cmdq_get_client(item);
 	struct window_pane_input_data	*cdata;
 
 	if (~wp->flags & PANE_EMPTY) {

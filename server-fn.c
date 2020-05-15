@@ -185,6 +185,7 @@ server_kill_pane(struct window_pane *wp)
 		recalculate_sizes();
 	} else {
 		server_unzoom_window(w);
+		server_client_remove_pane(wp);
 		layout_close_pane(wp);
 		window_remove_pane(w, wp);
 		server_redraw_window(w);
@@ -319,7 +320,7 @@ server_destroy_pane(struct window_pane *wp, int notify)
 		if (notify)
 			notify_pane("pane-died", wp);
 
-		screen_write_start(&ctx, wp, &wp->base);
+		screen_write_start_pane(&ctx, wp, &wp->base);
 		screen_write_scrollregion(&ctx, 0, screen_size_y(ctx.s) - 1);
 		screen_write_cursormove(&ctx, 0, screen_size_y(ctx.s) - 1, 0);
 		screen_write_linefeed(&ctx, 1, 8);
@@ -335,8 +336,8 @@ server_destroy_pane(struct window_pane *wp, int notify)
 			    tim);
 		} else if (WIFSIGNALED(wp->status)) {
 			screen_write_nputs(&ctx, -1, &gc,
-			    "Pane is dead (signal %d, %s)",
-			    WTERMSIG(wp->status),
+			    "Pane is dead (signal %s, %s)",
+			    sig2name(WTERMSIG(wp->status)),
 			    tim);
 		}
 
@@ -349,6 +350,7 @@ server_destroy_pane(struct window_pane *wp, int notify)
 		notify_pane("pane-exited", wp);
 
 	server_unzoom_window(w);
+	server_client_remove_pane(wp);
 	layout_close_pane(wp);
 	window_remove_pane(w, wp);
 

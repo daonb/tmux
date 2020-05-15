@@ -1,4 +1,181 @@
-CHANGES FROM 3.1 TO 3.2
+CHANGES FROM 3.1b TO 3.2
+
+* Add an active-pane client flag (set with attach-session -f, new-session -f
+  or refresh-client -f). This allows a client to have an independent active
+  pane for interactive use (the window client pane is still used for many
+  things however).
+
+* Add a mark to copy mode, this is set with the set-mark command (bound to X)
+  and appears with the entire line shown using copy-mode-mark-style and the
+  marked character in reverse. The jump-to-mark command (bound to M-x) swaps
+  the mark and the cursor positions.
+
+* Add a -D flag to make the tmux server run in the foreground and not as a
+  daemon.
+
+* Do not loop forever in copy mode when search finds an empty match.
+
+* Fix the next-matching-bracket logic when using vi(1) keys.
+
+* Add a customize mode where options may be browsed and changed, includes
+  adding a brief description of each option. Bound to C-b C by default.
+
+* Change message log (C-b ~) so there is one for the server rather than one per
+  client and it remains after detach, and make it useful by logging every
+  command.
+
+* Add M-+ and M-- to tree mode to expand and collapse all.
+
+* Change the existing client flags for control mode to apply for any client,
+  use the same mechanism for the read-only flag and add an ignore-size flag.
+
+  refresh-client -F has become -f (-F stays for backwards compatibility) and
+  attach-session and switch-client now have -f flags also. A new format
+  client_flags lists the flags and is shown by list-clients by default.
+
+  This separates the read-only flag from "ignore size" behaviour (new
+  ignore-size) flag - both behaviours are useful in different circumstances.
+
+  attach -r and switchc -r remain and set or toggle both flags together.
+
+* Store and restore cursor position when copy mode is resized.
+
+* Export TERM_PROGRAM and TERM_PROGRAM_VERSION like various other terminals.
+
+* Add formats for after hook command arguments: hook_arguments with all the
+  arguments together; hook_argument_0, hook_argument_1 and so on with
+  individual arguments; hook_flag_X if flag -X is present; hook_flag_X_0,
+  hook_flag_X_1 and so on if -X appears multiple times.
+
+* Try to search the entire history first for up to 200 ms so a search count can
+  be shown. If it takes too long, search the visible text only.
+
+* Use VIS_CSTYLE for paste buffers also (show \012 as \n).
+
+* Change default formats for tree mode, client mode and buffer mode to be more
+  compact and remove some clutter.
+
+* Add a key (e) in buffer mode to open the buffer in an editor. The buffer
+  contents is updated when the editor exits.
+
+* Add -e flag for new-session to set environment variables, like the same flag
+  for new-window.
+
+* Improve search match marking in copy mode. Two new options
+  copy-mode-match-style and copy-mode-current-match-style to set the style for
+  matches and for the current match respectively. Also a change so that if a
+  copy key is pressed with no selection, the current match (if any) is copied.
+
+* Sanitize session names like window names instead of forbidding invalid ones.
+
+* Check if the clear terminfo(5) capability starts with CSI and if so then
+  assume the terminal is VT100-like, rather than relying on the XT capability.
+
+* Improve command prompt tab completion and add menus both for strings and -t
+  and -s (when used without a trailing space). command-prompt has additional
+  flags for only completing a window (-W) and a target (-T), allowing C-b ' to
+  only show windows and C-b . only targets.
+
+* Change all the style options to string options so they can support formats.
+  Change pane-border-active-style to use this to change the border colour when
+  in a mode or with synchronize-panes on. This also implies a few minor changes
+  to existing behaviour:
+
+  - set-option -a with a style option automatically inserts a comma between the
+    old value and appended text.
+
+  - OSC 10 and 11 no longer set the window-style option, instead they store the
+    colour internally in the pane data and it is used as the default when the
+    option is evaluated.
+
+  - status-fg and -bg now override status-style instead of the option values
+    being changed.
+
+* Add extension terminfo(5) capabilities for margins and focus reporting.
+
+* Try $XDG_CONFIG_HOME/tmux/tmux.conf as well as ~/.config/tmux/tmux.conf for
+  configuration file (the search paths are in TMUX_CONF in Makefile.am).
+
+* Remove the DSR 1337 iTerm2 extension and replace by the extended device
+  attributes sequence (CSI > q) supported by more terminals.
+
+* Add a -s flag to copy-mode to specify a different pane for the source
+  content. This means it is possible to view two places in a pane's history at
+  the same time in different panes, or view the history while still using the
+  pane. Pressing r refreshes the content from the source pane.
+
+* Add an argument to list-commands to show only a single command.
+
+* Change copy mode to make copy of the pane history so it does not need to
+  freeze the pane.
+
+* Restore pane_current_path format from portable tmux on OpenBSD.
+
+* Wait until the initial command sequence is done before sending a device
+  attributes request and other bits that prompt a reply from the terminal. This
+  means that stray relies are not left on the terminal if the command has
+  attached and then immediately detached and tmux will not be around to receive
+  them.
+
+* Add a -f filter argument to the list commands like choose-tree.
+
+* Move specific hooks for panes to pane options and windows for window options
+  rather than all hooks being session options. These hooks are now window options:
+
+  window-layout-changed
+  window-linked
+  window-pane-changed
+  window-renamed
+  window-unlinked
+
+  And these now pane options:
+
+  pane-died
+  pane-exited
+  pane-focus-in
+  pane-focus-out
+  pane-mode-changed
+  pane-set-clipboard
+
+  Any existing configurations using these hooks on a session rather than
+  globally (that is, set-hook or set-option without -g) may need to be changed.
+
+* Show signal names when a process exits with remain-on-exit on platforms which
+  have a way to get them.
+
+* Start menu with top item selected if no mouse and use mode-style for the
+  selected item.
+
+* Add a copy-command option and change copy-pipe and friends to pipe to it if
+  used without arguments, allows all the default copy key bindings to be
+  changed to pipe with one option rather than needing to change each key
+  binding individually.
+
+* Tidy up the terminal detection and feature code and add named sets of
+  terminal features, each of which are defined in one place and map to a
+  builtin set of terminfo(5) capabilities. Features can be specified based on
+  TERM with a new terminal-features option or with the -T flag when running
+  tmux. tmux will also detect a few common terminals from the DA and DSR
+  responses.
+
+  This is intended to make it easier to configure tmux's use of terminfo(5)
+  even in the presence of outdated ncurses(3) or terminfo(5) databases or for
+  features which do not yet have a terminfo(5) entry. Instead of having to grok
+  terminfo(5) capability names and what they should be set to in the
+  terminal-overrides option, the user can hopefully just give tmux a feature
+  name and let it do the right thing.
+
+  The terminal-overrides option remains both for backwards compatibility and to
+  allow tweaks of individual capabilities.
+
+* Support mintty's application escape sequence (means tmux doesn't have to
+  delay to wait for Escape, so no need to reduce escape-time when using
+  mintty).
+
+* Change so main-pane-width and height can be given as a percentage.
+
+* Support for the iTerm2 synchronized updates feature (allows the terminal to
+  avoid unnecessary drawing while output is still in progress).
 
 * Make the mouse_word and mouse_line formats work in copy mode and enable the
   default pane menu in copy mode.
@@ -39,7 +216,23 @@ CHANGES FROM 3.1 TO 3.2
 
 * Add number operators for formats (+, -, *, / and m),
 
+CHANGES FROM 3.1a TO 3.1b
+
+* Fix build on systems without sys/queue.h.
+
+* Fix crash when allow-rename is on and an empty name is set.
+
+CHANGES FROM 3.1 TO 3.1a
+
+* Do not close stdout prematurely in control mode since it is needed to print
+  exit messages. Prevents hanging when detaching with iTerm2.
+
 CHANGES FROM 3.0a TO 3.1
+
+* Only search the visible part of the history when marking (highlighting)
+  search terms. This is much faster than searching the whole history and solves
+  problems with large histories. The count of matches shown is now the visible
+  matches rather than all matches.
 
 * Search using regular expressions in copy mode. search-forward and
   search-backward use regular expressions by default; the incremental versions

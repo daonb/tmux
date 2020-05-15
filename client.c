@@ -18,6 +18,7 @@
 
 #include <sys/types.h>
 #include <sys/socket.h>
+#include <sys/uio.h>
 #include <sys/un.h>
 #include <sys/wait.h>
 #include <sys/file.h>
@@ -57,7 +58,7 @@ static struct client_files client_files = RB_INITIALIZER(&client_files);
 static __dead void	 client_exec(const char *,const char *);
 static int		 client_get_lock(char *);
 static int		 client_connect(struct event_base *, const char *, int);
-static void		 client_send_identify(const char *, const char *);
+static void		 client_send_identify(const char *, const char *, int);
 static void		 client_signal(int);
 static void		 client_dispatch(struct imsg *, void *);
 static void		 client_dispatch_attached(struct imsg *);
@@ -233,10 +234,9 @@ client_exit(void)
 
 /* Client main loop. */
 int
-client_main(struct event_base *base, int argc, char **argv, int flags)
+client_main(struct event_base *base, int argc, char **argv, int flags, int feat)
 {
 	struct cmd_parse_result	*pr;
-	struct cmd		*cmd;
 	struct msg_command	*data;
 	int			 fd, i;
 	const char		*ttynam, *cwd;
@@ -265,10 +265,8 @@ client_main(struct event_base *base, int argc, char **argv, int flags)
 		 */
 		pr = cmd_parse_from_arguments(argc, argv, NULL);
 		if (pr->status == CMD_PARSE_SUCCESS) {
-			TAILQ_FOREACH(cmd, &pr->cmdlist->list, qentry) {
-				if (cmd->entry->flags & CMD_STARTSERVER)
-					flags |= CLIENT_STARTSERVER;
-			}
+			if (cmd_list_any_have(pr->cmdlist, CMD_STARTSERVER))
+				flags |= CLIENT_STARTSERVER;
 			cmd_list_free(pr->cmdlist);
 		} else
 			free(pr->error);
@@ -345,7 +343,7 @@ client_main(struct event_base *base, int argc, char **argv, int flags)
 	}
 
 	/* Send identify messages. */
-	client_send_identify(ttynam, cwd);
+	client_send_identify(ttynam, cwd, feat);
 
 	/* Send first command. */
 	if (msg == MSG_COMMAND) {
@@ -411,7 +409,7 @@ client_main(struct event_base *base, int argc, char **argv, int flags)
 
 /* Send identify messages to server. */
 static void
-client_send_identify(const char *ttynam, const char *cwd)
+client_send_identify(const char *ttynam, const char *cwd, int feat)
 {
 	const char	 *s;
 	char		**ss;
@@ -424,6 +422,7 @@ client_send_identify(const char *ttynam, const char *cwd)
 	if ((s = getenv("TERM")) == NULL)
 		s = "";
 	proc_send(client_peer, MSG_IDENTIFY_TERM, -1, s, strlen(s) + 1);
+	proc_send(client_peer, MSG_IDENTIFY_FEATURES, -1, &feat, sizeof feat);
 
 	proc_send(client_peer, MSG_IDENTIFY_TTYNAME, -1, ttynam,
 	    strlen(ttynam) + 1);
@@ -522,7 +521,7 @@ client_write_open(void *data, size_t datalen)
 			errno = EBADF;
 		else {
 			cf->fd = dup(msg->fd);
-			if (client_flags & CLIENT_CONTROL)
+			if (~client_flags & CLIENT_CONTROL)
 				close(msg->fd); /* can only be used once */
 		}
 	}
@@ -646,7 +645,7 @@ client_read_open(void *data, size_t datalen)
 	struct msg_read_done	 reply;
 	struct client_file	 find, *cf;
 	const int		 flags = O_NONBLOCK|O_RDONLY;
-	int			 error = 0;
+	int			 error;
 
 	if (datalen < sizeof *msg)
 		fatalx("bad MSG_READ_OPEN size");
@@ -677,7 +676,8 @@ client_read_open(void *data, size_t datalen)
 			errno = EBADF;
 		else {
 			cf->fd = dup(msg->fd);
-			close(msg->fd); /* can only be used once */
+			if (~client_flags & CLIENT_CONTROL)
+				close(msg->fd); /* can only be used once */
 		}
 	}
 	if (cf->fd == -1) {

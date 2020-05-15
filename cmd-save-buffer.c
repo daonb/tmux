@@ -72,11 +72,7 @@ cmd_save_buffer_done(__unused struct client *c, const char *path, int error,
 static enum cmd_retval
 cmd_save_buffer_exec(struct cmd *self, struct cmdq_item *item)
 {
-	struct args		*args = self->args;
-	struct client		*c = cmd_find_client(item, NULL, 1);
-	struct session		*s = item->target.s;
-	struct winlink		*wl = item->target.wl;
-	struct window_pane	*wp = item->target.wp;
+	struct args		*args = cmd_get_args(self);
 	struct paste_buffer	*pb;
 	int			 flags;
 	const char		*bufname = args_get(args, 'b'), *bufdata;
@@ -97,15 +93,15 @@ cmd_save_buffer_exec(struct cmd *self, struct cmdq_item *item)
 	}
 	bufdata = paste_buffer_data(pb, &bufsize);
 
-	if (self->entry == &cmd_show_buffer_entry)
+	if (cmd_get_entry(self) == &cmd_show_buffer_entry)
 		path = xstrdup("-");
 	else
-		path = format_single(item, args->argv[0], c, s, wl, wp);
-	if (args_has(self->args, 'a'))
+		path = format_single_from_target(item, args->argv[0]);
+	if (args_has(args, 'a'))
 		flags = O_APPEND;
 	else
 		flags = 0;
-	file_write(item->client, path, flags, bufdata, bufsize,
+	file_write(cmdq_get_client(item), path, flags, bufdata, bufsize,
 	    cmd_save_buffer_done, item);
 	free(path);
 

@@ -52,7 +52,7 @@ static int	tty_keys_clipboard(struct tty *, const char *, size_t,
 		    size_t *);
 static int	tty_keys_device_attributes(struct tty *, const char *, size_t,
 		    size_t *);
-static int	tty_keys_device_status_report(struct tty *, const char *,
+static int	tty_keys_extended_device_attributes(struct tty *, const char *,
 		    size_t, size_t *);
 
 /* Default raw keys. */
@@ -61,6 +61,9 @@ struct tty_default_key_raw {
 	key_code	 	key;
 };
 static const struct tty_default_key_raw tty_default_raw_keys[] = {
+	/* Application escape. */
+	{ "\033O[", '\033' },
+
 	/*
 	 * Numeric keypad. Just use the vt100 escape sequences here and always
 	 * put the terminal into keypad_xmit mode. Translation of numbers
@@ -609,8 +612,8 @@ tty_keys_next(struct tty *tty)
 		goto partial_key;
 	}
 
-	/* Is this a device status report response? */
-	switch (tty_keys_device_status_report(tty, buf, len, &size)) {
+	/* Is this an extended device attributes response? */
+	switch (tty_keys_extended_device_attributes(tty, buf, len, &size)) {
 	case 0:		/* yes */
 		key = KEYC_UNKNOWN;
 		goto complete_key;
@@ -933,7 +936,7 @@ tty_keys_clipboard(__unused struct tty *tty, const char *buf, size_t len,
 
 	*size = 0;
 
-	/* First three bytes are always \033]52;. */
+	/* First five bytes are always \033]52;. */
 	if (buf[0] != '\033')
 		return (-1);
 	if (len == 1)
@@ -1007,8 +1010,8 @@ tty_keys_clipboard(__unused struct tty *tty, const char *buf, size_t len,
 }
 
 /*
- * Handle device attributes input. Returns 0 for success, -1 for failure, 1 for
- * partial.
+ * Handle secondary device attributes input. Returns 0 for success, -1 for
+ * failure, 1 for partial.
  */
 static int
 tty_keys_device_attributes(struct tty *tty, const char *buf, size_t len,
@@ -1017,7 +1020,6 @@ tty_keys_device_attributes(struct tty *tty, const char *buf, size_t len,
 	struct client	*c = tty->client;
 	u_int		 i, n = 0;
 	char		 tmp[64], *endptr, p[32] = { 0 }, *cp, *next;
-	int		 flags = 0;
 
 	*size = 0;
 	if (tty->flags & TTY_HAVEDA)
@@ -1032,15 +1034,17 @@ tty_keys_device_attributes(struct tty *tty, const char *buf, size_t len,
 		return (-1);
 	if (len == 2)
 		return (1);
-	if (buf[2] != '?')
+	if (buf[2] != '>')
 		return (-1);
 	if (len == 3)
 		return (1);
 
 	/* Copy the rest up to a 'c'. */
-	for (i = 0; i < (sizeof tmp) - 1 && buf[3 + i] != 'c'; i++) {
+	for (i = 0; i < (sizeof tmp) - 1; i++) {
 		if (3 + i == len)
 			return (1);
+		if (buf[3 + i] == 'c')
+			break;
 		tmp[i] = buf[3 + i];
 	}
 	if (i == (sizeof tmp) - 1)
@@ -1048,7 +1052,7 @@ tty_keys_device_attributes(struct tty *tty, const char *buf, size_t len,
 	tmp[i] = '\0';
 	*size = 4 + i;
 
-	/* Convert version numbers. */
+	/* Convert all arguments to numbers. */
 	cp = tmp;
 	while ((next = strsep(&cp, ";")) != NULL) {
 		p[n] = strtoul(next, &endptr, 10);
@@ -1057,73 +1061,92 @@ tty_keys_device_attributes(struct tty *tty, const char *buf, size_t len,
 		n++;
 	}
 
-	/* Set terminal flags. */
+	/* Add terminal features. */
 	switch (p[0]) {
-	case 64: /* VT420 */
-		flags |= (TERM_DECFRA|TERM_DECSLRM);
+	case 41: /* VT420 */
+		tty_add_features(&c->term_features, "margins,rectfill", ",");
+		break;
+	case 'M': /* mintty */
+		tty_default_features(&c->term_features, "mintty", 0);
+		break;
+	case 'T': /* tmux */
+		tty_default_features(&c->term_features, "tmux", 0);
+		break;
+	case 'U': /* rxvt-unicode */
+		tty_default_features(&c->term_features, "rxvt-unicode", 0);
 		break;
 	}
-	for (i = 1; i < n; i++)
-		log_debug("%s: DA feature: %d", c->name, p[i]);
-	log_debug("%s: received DA %.*s", c->name, (int)*size, buf);
+	log_debug("%s: received secondary DA %.*s", c->name, (int)*size, buf);
 
-	tty_set_flags(tty, flags);
+	tty_update_features(tty);
 	tty->flags |= TTY_HAVEDA;
 
 	return (0);
 }
 
 /*
- * Handle device status report input. Returns 0 for success, -1 for failure, 1
- * for partial.
+ * Handle extended device attributes input. Returns 0 for success, -1 for
+ * failure, 1 for partial.
  */
 static int
-tty_keys_device_status_report(struct tty *tty, const char *buf, size_t len,
-    size_t *size)
+tty_keys_extended_device_attributes(struct tty *tty, const char *buf,
+    size_t len, size_t *size)
 {
 	struct client	*c = tty->client;
 	u_int		 i;
-	char		 tmp[64];
-	int		 flags = 0;
+	char		 tmp[128];
 
 	*size = 0;
-	if (tty->flags & TTY_HAVEDSR)
+	if (tty->flags & TTY_HAVEXDA)
 		return (-1);
 
-	/* First three bytes are always \033[. */
+	/* First four bytes are always \033P>|. */
 	if (buf[0] != '\033')
 		return (-1);
 	if (len == 1)
 		return (1);
-	if (buf[1] != '[')
+	if (buf[1] != 'P')
 		return (-1);
 	if (len == 2)
 		return (1);
-	if (buf[2] != 'I' && buf[2] != 'T')
+	if (buf[2] != '>')
 		return (-1);
 	if (len == 3)
 		return (1);
+	if (buf[3] != '|')
+		return (-1);
+	if (len == 4)
+		return (1);
 
-	/* Copy the rest up to a 'n'. */
-	for (i = 0; i < (sizeof tmp) - 1 && buf[2 + i] != 'n'; i++) {
-		if (2 + i == len)
+	/* Copy the rest up to a '\033\\'. */
+	for (i = 0; i < (sizeof tmp) - 1; i++) {
+		if (4 + i == len)
 			return (1);
-		tmp[i] = buf[2 + i];
+		if (buf[4 + i - 1] == '\033' && buf[4 + i] == '\\')
+			break;
+		tmp[i] = buf[4 + i];
 	}
 	if (i == (sizeof tmp) - 1)
 		return (-1);
-	tmp[i] = '\0';
-	*size = 3 + i;
+	tmp[i - 1] = '\0';
+	*size = 5 + i;
 
-	/* Set terminal flags. */
-	if (strncmp(tmp, "ITERM2 ", 7) == 0)
-		flags |= (TERM_DECSLRM|TERM_256COLOURS|TERM_RGBCOLOURS);
-	if (strncmp(tmp, "TMUX ", 5) == 0)
-		flags |= (TERM_256COLOURS|TERM_RGBCOLOURS);
-	log_debug("%s: received DSR %.*s", c->name, (int)*size, buf);
+	/* Add terminal features. */
+	if (strncmp(tmp, "iTerm2 ", 7) == 0)
+		tty_default_features(&c->term_features, "iTerm2", 0);
+	else if (strncmp(tmp, "tmux ", 5) == 0)
+		tty_default_features(&c->term_features, "tmux", 0);
+	else if (strncmp(tmp, "XTerm(", 6) == 0)
+		tty_default_features(&c->term_features, "xterm", 0);
+	else if (strncmp(tmp, "mintty ", 7) == 0)
+		tty_default_features(&c->term_features, "mintty", 0);
+	log_debug("%s: received extended DA %.*s", c->name, (int)*size, buf);
 
-	tty_set_flags(tty, flags);
-	tty->flags |= TTY_HAVEDSR;
+	free(c->term_type);
+	c->term_type = xstrdup(tmp);
+
+	tty_update_features(tty);
+	tty->flags |= TTY_HAVEXDA;
 
 	return (0);
 }

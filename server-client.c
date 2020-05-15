@@ -54,6 +54,19 @@ static void	server_client_dispatch_read_data(struct client *,
 static void	server_client_dispatch_read_done(struct client *,
 		    struct imsg *);
 
+/* Compare client windows. */
+static int
+server_client_window_cmp(struct client_window *cw1,
+    struct client_window *cw2)
+{
+	if (cw1->window < cw2->window)
+		return (-1);
+	if (cw1->window > cw2->window)
+		return (1);
+	return (0);
+}
+RB_GENERATE(client_windows, client_window, entry, server_client_window_cmp);
+
 /* Number of attached clients. */
 u_int
 server_client_how_many(void)
@@ -208,25 +221,14 @@ server_client_create(int fd)
 	c->fd = -1;
 	c->cwd = NULL;
 
-	TAILQ_INIT(&c->queue);
+	c->queue = cmdq_new();
+	RB_INIT(&c->windows);
 
 	c->tty.fd = -1;
-	c->title = NULL;
-
-	c->session = NULL;
-	c->last_session = NULL;
-
 	c->tty.sx = 80;
 	c->tty.sy = 24;
 
 	status_init(c);
-
-	c->message_string = NULL;
-	TAILQ_INIT(&c->message_log);
-
-	c->prompt_string = NULL;
-	c->prompt_buffer = NULL;
-	c->prompt_index = 0;
 
 	RB_INIT(&c->files);
 
@@ -247,11 +249,22 @@ server_client_create(int fd)
 int
 server_client_open(struct client *c, char **cause)
 {
+	const char	*ttynam = _PATH_TTY;
+
 	if (c->flags & CLIENT_CONTROL)
 		return (0);
 
-	if (strcmp(c->ttyname, "/dev/tty") == 0) {
-		*cause = xstrdup("can't use /dev/tty");
+	if (strcmp(c->ttyname, ttynam) == 0||
+	    ((isatty(STDIN_FILENO) &&
+	    (ttynam = ttyname(STDIN_FILENO)) != NULL &&
+	    strcmp(c->ttyname, ttynam) == 0) ||
+	    (isatty(STDOUT_FILENO) &&
+	    (ttynam = ttyname(STDOUT_FILENO)) != NULL &&
+	    strcmp(c->ttyname, ttynam) == 0) ||
+	    (isatty(STDERR_FILENO) &&
+	    (ttynam = ttyname(STDERR_FILENO)) != NULL &&
+	    strcmp(c->ttyname, ttynam) == 0))) {
+		xasprintf(cause, "can't use %s", c->ttyname);
 		return (-1);
 	}
 
@@ -270,8 +283,8 @@ server_client_open(struct client *c, char **cause)
 void
 server_client_lost(struct client *c)
 {
-	struct message_entry	*msg, *msg1;
-	struct client_file	*cf;
+	struct client_file	*cf, *cf1;
+	struct client_window	*cw, *cw1;
 
 	c->flags |= CLIENT_DEAD;
 
@@ -279,9 +292,13 @@ server_client_lost(struct client *c)
 	status_prompt_clear(c);
 	status_message_clear(c);
 
-	RB_FOREACH(cf, client_files, &c->files) {
+	RB_FOREACH_SAFE(cf, client_files, &c->files, cf1) {
 		cf->error = EINTR;
 		file_fire_done(cf);
+	}
+	RB_FOREACH_SAFE(cw, client_windows, &c->windows, cw1) {
+		RB_REMOVE(client_windows, &c->windows, cw);
+		free(cw);
 	}
 
 	TAILQ_REMOVE(&clients, c, entry);
@@ -294,7 +311,9 @@ server_client_lost(struct client *c)
 	if (c->flags & CLIENT_TERMINAL)
 		tty_free(&c->tty);
 	free(c->ttyname);
-	free(c->term);
+
+	free(c->term_name);
+	free(c->term_type);
 
 	status_free(c);
 
@@ -309,11 +328,6 @@ server_client_lost(struct client *c)
 	free(c->message_string);
 	if (event_initialized(&c->message_timer))
 		evtimer_del(&c->message_timer);
-	TAILQ_FOREACH_SAFE(msg, &c->message_log, entry, msg1) {
-		free(msg->msg);
-		TAILQ_REMOVE(&c->message_log, msg, entry);
-		free(msg);
-	}
 
 	free(c->prompt_saved);
 	free(c->prompt_string);
@@ -353,8 +367,7 @@ server_client_free(__unused int fd, __unused short events, void *arg)
 
 	log_debug("free client %p (%d references)", c, c->references);
 
-	if (!TAILQ_EMPTY(&c->queue))
-		fatalx("queue not empty");
+	cmdq_free(c->queue);
 
 	if (c->references == 0) {
 		free((void *)c->name);
@@ -604,10 +617,9 @@ have_event:
 			wp = window_get_active_at(s->curw->window, px, py);
 			if (wp != NULL)
 				where = PANE;
+			else
+				return (KEYC_UNKNOWN);
 		}
-
-		if (where == NOWHERE)
-			return (KEYC_UNKNOWN);
 		if (where == PANE)
 			log_debug("mouse %u,%u on pane %%%u", x, y, wp->id);
 		else if (where == BORDER)
@@ -1081,7 +1093,7 @@ server_client_update_latest(struct client *c)
 static enum cmd_retval
 server_client_key_callback(struct cmdq_item *item, void *data)
 {
-	struct client			*c = item->client;
+	struct client			*c = cmdq_get_client(item);
 	struct key_event		*event = data;
 	key_code			 key = event->key;
 	struct mouse_event		*m = &event->m;
@@ -1126,11 +1138,12 @@ server_client_key_callback(struct cmdq_item *item, void *data)
 			c->tty.mouse_drag_update(c, m);
 			goto out;
 		}
+		event->key = key;
 	}
 
 	/* Find affected pane. */
 	if (!KEYC_IS_MOUSE(key) || cmd_find_from_mouse(&fs, m, 0) != 0)
-		cmd_find_from_session(&fs, s, 0);
+		cmd_find_from_client(&fs, c, 0);
 	wp = fs.wp;
 
 	/* Forward mouse keys if disabled. */
@@ -1223,7 +1236,7 @@ try_again:
 		server_status_client(c);
 
 		/* Execute the key binding. */
-		key_bindings_dispatch(bd, item, c, m, &fs);
+		key_bindings_dispatch(bd, item, c, event, &fs);
 		key_bindings_unref_table(table);
 		goto out;
 	}
@@ -1294,10 +1307,6 @@ server_client_handle_key(struct client *c, struct key_event *event)
 	 */
 	if (~c->flags & CLIENT_READONLY) {
 		status_message_clear(c);
-		if (c->prompt_string != NULL) {
-			if (status_prompt_key(c, event->key) == 0)
-				return (0);
-		}
 		if (c->overlay_key != NULL) {
 			switch (c->overlay_key(c, event)) {
 			case 0:
@@ -1308,6 +1317,10 @@ server_client_handle_key(struct client *c, struct key_event *event)
 			}
 		}
 		server_client_clear_overlay(c);
+		if (c->prompt_string != NULL) {
+			if (status_prompt_key(c, event->key) == 0)
+				return (0);
+		}
 	}
 
 	/*
@@ -1537,37 +1550,41 @@ focused:
 static void
 server_client_reset_state(struct client *c)
 {
+	struct tty		*tty = &c->tty;
 	struct window		*w = c->session->curw->window;
-	struct window_pane	*wp = w->active, *loop;
-	struct screen		*s;
+	struct window_pane	*wp = server_client_get_pane(c), *loop;
+	struct screen		*s = NULL;
 	struct options		*oo = c->session->options;
-	int			 mode, cursor = 0;
+	int			 mode = 0, cursor, flags;
 	u_int			 cx = 0, cy = 0, ox, oy, sx, sy;
 
 	if (c->flags & (CLIENT_CONTROL|CLIENT_SUSPENDED))
 		return;
 
+	/* Disable the block flag. */
+	flags = (tty->flags & TTY_BLOCK);
+	tty->flags &= ~TTY_BLOCK;
+
 	/* Get mode from overlay if any, else from screen. */
 	if (c->overlay_draw != NULL) {
-		s = NULL;
-		if (c->overlay_mode == NULL)
-			mode = 0;
-		else
-			mode = c->overlay_mode(c, &cx, &cy);
-	} else {
+		if (c->overlay_mode != NULL)
+			s = c->overlay_mode(c, &cx, &cy);
+	} else
 		s = wp->screen;
+	if (s != NULL)
 		mode = s->mode;
-	}
+	if (c->prompt_string != NULL || c->message_string != NULL)
+		mode &= ~MODE_CURSOR;
 	log_debug("%s: client %s mode %x", __func__, c->name, mode);
 
 	/* Reset region and margin. */
-	tty_region_off(&c->tty);
-	tty_margin_off(&c->tty);
+	tty_region_off(tty);
+	tty_margin_off(tty);
 
 	/* Move cursor to pane cursor and offset. */
 	if (c->overlay_draw == NULL) {
 		cursor = 0;
-		tty_window_offset(&c->tty, &ox, &oy, &sx, &sy);
+		tty_window_offset(tty, &ox, &oy, &sx, &sy);
 		if (wp->xoff + s->cx >= ox && wp->xoff + s->cx <= ox + sx &&
 		    wp->yoff + s->cy >= oy && wp->yoff + s->cy <= oy + sy) {
 			cursor = 1;
@@ -1581,7 +1598,8 @@ server_client_reset_state(struct client *c)
 		if (!cursor)
 			mode &= ~MODE_CURSOR;
 	}
-	tty_cursor(&c->tty, cx, cy);
+	log_debug("%s: cursor to %u,%u", __func__, cx, cy);
+	tty_cursor(tty, cx, cy);
 
 	/*
 	 * Set mouse mode if requested. To support dragging, always use button
@@ -1604,8 +1622,12 @@ server_client_reset_state(struct client *c)
 		mode &= ~MODE_BRACKETPASTE;
 
 	/* Set the terminal mode and reset attributes. */
-	tty_update_mode(&c->tty, mode, s);
-	tty_reset(&c->tty);
+	tty_update_mode(tty, mode, s);
+	tty_reset(tty);
+
+	/* All writing must be done, send a sync end (if it was started). */
+	tty_sync_end(tty);
+	tty->flags |= flags;
 }
 
 /* Repeat time callback. */
@@ -1680,8 +1702,11 @@ server_client_check_redraw(struct client *c)
 {
 	struct session		*s = c->session;
 	struct tty		*tty = &c->tty;
+	struct window		*w = c->session->curw->window;
 	struct window_pane	*wp;
-	int			 needed, flags;
+	int			 needed, flags, mode = tty->mode, new_flags = 0;
+	int			 redraw;
+	u_int			 bit = 0;
 	struct timeval		 tv = { .tv_usec = 1000 };
 	static struct event	 ev;
 	size_t			 left;
@@ -1689,11 +1714,12 @@ server_client_check_redraw(struct client *c)
 	if (c->flags & (CLIENT_CONTROL|CLIENT_SUSPENDED))
 		return;
 	if (c->flags & CLIENT_ALLREDRAWFLAGS) {
-		log_debug("%s: redraw%s%s%s%s", c->name,
+		log_debug("%s: redraw%s%s%s%s%s", c->name,
 		    (c->flags & CLIENT_REDRAWWINDOW) ? " window" : "",
 		    (c->flags & CLIENT_REDRAWSTATUS) ? " status" : "",
 		    (c->flags & CLIENT_REDRAWBORDERS) ? " borders" : "",
-		    (c->flags & CLIENT_REDRAWOVERLAY) ? " overlay" : "");
+		    (c->flags & CLIENT_REDRAWOVERLAY) ? " overlay" : "",
+		    (c->flags & CLIENT_REDRAWPANES) ? " panes" : "");
 	}
 
 	/*
@@ -1705,12 +1731,14 @@ server_client_check_redraw(struct client *c)
 	if (c->flags & CLIENT_ALLREDRAWFLAGS)
 		needed = 1;
 	else {
-		TAILQ_FOREACH(wp, &c->session->curw->window->panes, entry) {
+		TAILQ_FOREACH(wp, &w->panes, entry) {
 			if (wp->flags & PANE_REDRAW) {
 				needed = 1;
 				break;
 			}
 		}
+		if (needed)
+			new_flags |= CLIENT_REDRAWPANES;
 	}
 	if (needed && (left = EVBUFFER_LENGTH(tty->out)) != 0) {
 		log_debug("%s: redraw deferred (%zu left)", c->name, left);
@@ -1721,29 +1749,53 @@ server_client_check_redraw(struct client *c)
 			evtimer_add(&ev, &tv);
 		}
 
-		/*
-		 * We may have got here for a single pane redraw, but force a
-		 * full redraw next time in case other panes have been updated.
-		 */
-		c->flags |= CLIENT_ALLREDRAWFLAGS;
+		if (~c->flags & CLIENT_REDRAWWINDOW) {
+			TAILQ_FOREACH(wp, &w->panes, entry) {
+				if (wp->flags & PANE_REDRAW) {
+					log_debug("%s: pane %%%u needs redraw",
+					    c->name, wp->id);
+					c->redraw_panes |= (1 << bit);
+				}
+				if (++bit == 64) {
+					/*
+					 * If more that 64 panes, give up and
+					 * just redraw the window.
+					 */
+					new_flags &= CLIENT_REDRAWPANES;
+					new_flags |= CLIENT_REDRAWWINDOW;
+					break;
+				}
+			}
+			if (c->redraw_panes != 0)
+				c->flags |= CLIENT_REDRAWPANES;
+		}
+		c->flags |= new_flags;
 		return;
 	} else if (needed)
 		log_debug("%s: redraw needed", c->name);
 
 	flags = tty->flags & (TTY_BLOCK|TTY_FREEZE|TTY_NOCURSOR);
-	tty->flags = (tty->flags & ~(TTY_BLOCK|TTY_FREEZE)) | TTY_NOCURSOR;
+	tty->flags = (tty->flags & ~(TTY_BLOCK|TTY_FREEZE))|TTY_NOCURSOR;
 
 	if (~c->flags & CLIENT_REDRAWWINDOW) {
 		/*
 		 * If not redrawing the entire window, check whether each pane
 		 * needs to be redrawn.
 		 */
-		TAILQ_FOREACH(wp, &c->session->curw->window->panes, entry) {
-			if (wp->flags & PANE_REDRAW) {
-				tty_update_mode(tty, tty->mode, NULL);
-				screen_redraw_pane(c, wp);
-			}
+		TAILQ_FOREACH(wp, &w->panes, entry) {
+			redraw = 0;
+			if (wp->flags & PANE_REDRAW)
+				redraw = 1;
+			else if (c->flags & CLIENT_REDRAWPANES)
+				redraw = !!(c->redraw_panes & (1 << bit));
+			bit++;
+			if (!redraw)
+				continue;
+			log_debug("%s: redrawing pane %%%u", __func__, wp->id);
+			screen_redraw_pane(c, wp);
 		}
+		c->redraw_panes = 0;
+		c->flags &= ~CLIENT_REDRAWPANES;
 	}
 
 	if (c->flags & CLIENT_ALLREDRAWFLAGS) {
@@ -1752,8 +1804,9 @@ server_client_check_redraw(struct client *c)
 		screen_redraw_screen(c);
 	}
 
-	tty->flags = (tty->flags & ~(TTY_FREEZE|TTY_NOCURSOR)) | flags;
-	tty_update_mode(tty, tty->mode, NULL);
+	tty->flags = (tty->flags & ~TTY_NOCURSOR)|(flags & TTY_NOCURSOR);
+	tty_update_mode(tty, mode, NULL);
+	tty->flags = (tty->flags & ~(TTY_BLOCK|TTY_FREEZE|TTY_NOCURSOR))|flags;
 
 	c->flags &= ~(CLIENT_ALLREDRAWFLAGS|CLIENT_STATUSFORCE);
 
@@ -1812,6 +1865,7 @@ server_client_dispatch(struct imsg *imsg, void *arg)
 	datalen = imsg->hdr.len - IMSG_HEADER_SIZE;
 
 	switch (imsg->hdr.type) {
+	case MSG_IDENTIFY_FEATURES:
 	case MSG_IDENTIFY_FLAGS:
 	case MSG_IDENTIFY_TERM:
 	case MSG_IDENTIFY_TTYNAME:
@@ -1892,10 +1946,12 @@ server_client_dispatch(struct imsg *imsg, void *arg)
 static enum cmd_retval
 server_client_command_done(struct cmdq_item *item, __unused void *data)
 {
-	struct client	*c = item->client;
+	struct client	*c = cmdq_get_client(item);
 
 	if (~c->flags & CLIENT_ATTACHED)
 		c->flags |= CLIENT_EXIT;
+	else if (~c->flags & CLIENT_DETACHING)
+		tty_send_requests(&c->tty);
 	return (CMD_RETURN_NORMAL);
 }
 
@@ -1947,7 +2003,7 @@ server_client_dispatch_command(struct client *c, struct imsg *imsg)
 	}
 	cmd_free_argv(argc, argv);
 
-	cmdq_append(c, cmdq_get_command(pr->cmdlist, NULL, NULL, 0));
+	cmdq_append(c, cmdq_get_command(pr->cmdlist, NULL));
 	cmdq_append(c, cmdq_get_callback(server_client_command_done, NULL));
 
 	cmd_list_free(pr->cmdlist);
@@ -1968,7 +2024,7 @@ server_client_dispatch_identify(struct client *c, struct imsg *imsg)
 {
 	const char	*data, *home;
 	size_t		 datalen;
-	int		 flags;
+	int		 flags, feat;
 	char		*name;
 
 	if (c->flags & CLIENT_IDENTIFIED)
@@ -1978,6 +2034,14 @@ server_client_dispatch_identify(struct client *c, struct imsg *imsg)
 	datalen = imsg->hdr.len - IMSG_HEADER_SIZE;
 
 	switch (imsg->hdr.type)	{
+	case MSG_IDENTIFY_FEATURES:
+		if (datalen != sizeof feat)
+			fatalx("bad MSG_IDENTIFY_FEATURES size");
+		memcpy(&feat, data, sizeof feat);
+		c->term_features |= feat;
+		log_debug("client %p IDENTIFY_FEATURES %s", c,
+		    tty_get_features(feat));
+		break;
 	case MSG_IDENTIFY_FLAGS:
 		if (datalen != sizeof flags)
 			fatalx("bad MSG_IDENTIFY_FLAGS size");
@@ -1988,7 +2052,10 @@ server_client_dispatch_identify(struct client *c, struct imsg *imsg)
 	case MSG_IDENTIFY_TERM:
 		if (datalen == 0 || data[datalen - 1] != '\0')
 			fatalx("bad MSG_IDENTIFY_TERM string");
-		c->term = xstrdup(data);
+		if (*data == '\0')
+			c->term_name = xstrdup("unknown");
+		else
+			c->term_name = xstrdup(data);
 		log_debug("client %p IDENTIFY_TERM %s", c, data);
 		break;
 	case MSG_IDENTIFY_TTYNAME:
@@ -2053,14 +2120,10 @@ server_client_dispatch_identify(struct client *c, struct imsg *imsg)
 		control_start(c);
 		c->tty.fd = -1;
 	} else if (c->fd != -1) {
-		if (tty_init(&c->tty, c, c->fd, c->term) != 0) {
+		if (tty_init(&c->tty, c, c->fd) != 0) {
 			close(c->fd);
 			c->fd = -1;
 		} else {
-			if (c->flags & CLIENT_UTF8)
-				c->tty.flags |= TTY_UTF8;
-			if (c->flags & CLIENT_256COLOURS)
-				c->tty.term_flags |= TERM_256COLOURS;
 			tty_resize(&c->tty);
 			c->flags |= CLIENT_TERMINAL;
 		}
@@ -2156,37 +2219,6 @@ server_client_dispatch_read_done(struct client *c, struct imsg *imsg)
 	file_fire_done(cf);
 }
 
-/* Add to client message log. */
-void
-server_client_add_message(struct client *c, const char *fmt, ...)
-{
-	struct message_entry	*msg, *msg1;
-	char			*s;
-	va_list			 ap;
-	u_int			 limit;
-
-	va_start(ap, fmt);
-	xvasprintf(&s, fmt, ap);
-	va_end(ap);
-
-	log_debug("message %s (client %p)", s, c);
-
-	msg = xcalloc(1, sizeof *msg);
-	msg->msg_time = time(NULL);
-	msg->msg_num = c->message_next++;
-	msg->msg = s;
-	TAILQ_INSERT_TAIL(&c->message_log, msg, entry);
-
-	limit = options_get_number(global_options, "message-limit");
-	TAILQ_FOREACH_SAFE(msg, &c->message_log, entry, msg1) {
-		if (msg->msg_num + limit >= c->message_next)
-			break;
-		free(msg->msg);
-		TAILQ_REMOVE(&c->message_log, msg, entry);
-		free(msg);
-	}
-}
-
 /* Get client working directory. */
 const char *
 server_client_get_cwd(struct client *c, struct session *s)
@@ -2204,4 +2236,130 @@ server_client_get_cwd(struct client *c, struct session *s)
 	if ((home = find_home()) != NULL)
 		return (home);
 	return ("/");
+}
+
+/* Set client flags. */
+void
+server_client_set_flags(struct client *c, const char *flags)
+{
+	char	*s, *copy, *next;
+	int	 flag, not;
+
+	s = copy = xstrdup (flags);
+	while ((next = strsep(&s, ",")) != NULL) {
+		not = (*next == '!');
+		if (not)
+			next++;
+
+		if (strcmp(next, "no-output") == 0)
+			flag = CLIENT_CONTROL_NOOUTPUT;
+		else if (strcmp(next, "read-only") == 0)
+			flag = CLIENT_READONLY;
+		else if (strcmp(next, "ignore-size") == 0)
+			flag = CLIENT_IGNORESIZE;
+		else if (strcmp(next, "active-pane") == 0)
+			flag = CLIENT_ACTIVEPANE;
+		else
+			continue;
+
+		log_debug("client %s set flag %s", c->name, next);
+		if (not)
+			c->flags &= ~flag;
+		else
+			c->flags |= flag;
+	}
+	free(copy);
+
+}
+
+/* Get client flags. This is only flags useful to show to users. */
+const char *
+server_client_get_flags(struct client *c)
+{
+	static char s[256];
+
+	*s = '\0';
+	if (c->flags & CLIENT_ATTACHED)
+		strlcat(s, "attached,", sizeof s);
+	if (c->flags & CLIENT_CONTROL)
+		strlcat(s, "control-mode,", sizeof s);
+	if (c->flags & CLIENT_IGNORESIZE)
+		strlcat(s, "ignore-size,", sizeof s);
+	if (c->flags & CLIENT_CONTROL_NOOUTPUT)
+		strlcat(s, "no-output,", sizeof s);
+	if (c->flags & CLIENT_READONLY)
+		strlcat(s, "read-only,", sizeof s);
+	if (c->flags & CLIENT_ACTIVEPANE)
+		strlcat(s, "active-pane,", sizeof s);
+	if (c->flags & CLIENT_SUSPENDED)
+		strlcat(s, "suspended,", sizeof s);
+	if (c->flags & CLIENT_UTF8)
+		strlcat(s, "UTF-8,", sizeof s);
+	if (*s != '\0')
+		s[strlen(s) - 1] = '\0';
+	return (s);
+}
+
+/* Get client window. */
+static struct client_window *
+server_client_get_client_window(struct client *c, u_int id)
+{
+	struct client_window	cw = { .window = id };
+
+	return (RB_FIND(client_windows, &c->windows, &cw));
+}
+
+/* Get client active pane. */
+struct window_pane *
+server_client_get_pane(struct client *c)
+{
+	struct session		*s = c->session;
+	struct client_window	*cw;
+
+	if (s == NULL)
+		return (NULL);
+
+	if (~c->flags & CLIENT_ACTIVEPANE)
+		return (s->curw->window->active);
+	cw = server_client_get_client_window(c, s->curw->window->id);
+	if (cw == NULL)
+		return (s->curw->window->active);
+	return (cw->pane);
+}
+
+/* Set client active pane. */
+void
+server_client_set_pane(struct client *c, struct window_pane *wp)
+{
+	struct session		*s = c->session;
+	struct client_window	*cw;
+
+	if (s == NULL)
+		return;
+
+	cw = server_client_get_client_window(c, s->curw->window->id);
+	if (cw == NULL) {
+		cw = xcalloc(1, sizeof *cw);
+		cw->window = s->curw->window->id;
+		RB_INSERT(client_windows, &c->windows, cw);
+	}
+	cw->pane = wp;
+	log_debug("%s pane now %%%u", c->name, wp->id);
+}
+
+/* Remove pane from client lists. */
+void
+server_client_remove_pane(struct window_pane *wp)
+{
+	struct client		*c;
+	struct window		*w = wp->window;
+	struct client_window	*cw;
+
+	TAILQ_FOREACH(c, &clients, entry) {
+		cw = server_client_get_client_window(c, w->id);
+		if (cw != NULL && cw->pane == wp) {
+			RB_REMOVE(client_windows, &c->windows, cw);
+			free(cw);
+		}
+	}
 }

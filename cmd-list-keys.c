@@ -68,7 +68,8 @@ cmd_list_keys_get_width(const char *tablename, key_code only)
 	while (bd != NULL) {
 		if ((only != KEYC_UNKNOWN && bd->key != only) ||
 		    KEYC_IS_MOUSE(bd->key) ||
-		    bd->note == NULL) {
+		    bd->note == NULL ||
+		    *bd->note == '\0') {
 			bd = key_bindings_next(table, bd);
 			continue;
 		}
@@ -85,7 +86,7 @@ static int
 cmd_list_keys_print_notes(struct cmdq_item *item, struct args *args,
     const char *tablename, u_int keywidth, key_code only, const char *prefix)
 {
-	struct client		*c = cmd_find_client(item, NULL, 1);
+	struct client		*tc = cmdq_get_target_client(item);
 	struct key_table	*table;
 	struct key_binding	*bd;
 	const char		*key;
@@ -99,20 +100,21 @@ cmd_list_keys_print_notes(struct cmdq_item *item, struct args *args,
 	while (bd != NULL) {
 		if ((only != KEYC_UNKNOWN && bd->key != only) ||
 		    KEYC_IS_MOUSE(bd->key) ||
-		    (bd->note == NULL && !args_has(args, 'a'))) {
+		    ((bd->note == NULL || *bd->note == '\0') &&
+		    !args_has(args, 'a'))) {
 			bd = key_bindings_next(table, bd);
 			continue;
 		}
 		found = 1;
 		key = key_string_lookup_key(bd->key);
 
-		if (bd->note == NULL)
+		if (bd->note == NULL || *bd->note == '\0')
 			note = cmd_list_print(bd->cmdlist, 1);
 		else
 			note = xstrdup(bd->note);
 		tmp = utf8_padcstr(key, keywidth + 1);
-		if (args_has(args, '1') && c != NULL)
-			status_message_set(c, "%s%s%s", prefix, tmp, note);
+		if (args_has(args, '1') && tc != NULL)
+			status_message_set(tc, 1, "%s%s%s", prefix, tmp, note);
 		else
 			cmdq_print(item, "%s%s%s", prefix, tmp, note);
 		free(tmp);
@@ -144,7 +146,7 @@ cmd_list_keys_get_prefix(struct args *args, key_code *prefix)
 static enum cmd_retval
 cmd_list_keys_exec(struct cmd *self, struct cmdq_item *item)
 {
-	struct args		*args = self->args;
+	struct args		*args = cmd_get_args(self);
 	struct key_table	*table;
 	struct key_binding	*bd;
 	const char		*tablename, *r;
@@ -153,7 +155,7 @@ cmd_list_keys_exec(struct cmd *self, struct cmdq_item *item)
 	int			 repeat, width, tablewidth, keywidth, found = 0;
 	size_t			 tmpsize, tmpused, cplen;
 
-	if (self->entry == &cmd_list_commands_entry)
+	if (cmd_get_entry(self) == &cmd_list_commands_entry)
 		return (cmd_list_keys_commands(self, item));
 
 	if (args->argc != 0) {
@@ -269,7 +271,7 @@ cmd_list_keys_exec(struct cmd *self, struct cmdq_item *item)
 				tmpsize *= 2;
 				tmp = xrealloc(tmp, tmpsize);
 			}
-			tmpused = strlcat(tmp, cp, tmpsize);
+			strlcat(tmp, cp, tmpsize);
 			tmpused = strlcat(tmp, " ", tmpsize);
 			free(cp);
 
@@ -279,7 +281,7 @@ cmd_list_keys_exec(struct cmd *self, struct cmdq_item *item)
 				tmpsize *= 2;
 				tmp = xrealloc(tmp, tmpsize);
 			}
-			tmpused = strlcat(tmp, cp, tmpsize);
+			strlcat(tmp, cp, tmpsize);
 			tmpused = strlcat(tmp, " ", tmpsize);
 			free(cp);
 
@@ -313,7 +315,7 @@ out:
 static enum cmd_retval
 cmd_list_keys_commands(struct cmd *self, struct cmdq_item *item)
 {
-	struct args		 *args = self->args;
+	struct args		 *args = cmd_get_args(self);
 	const struct cmd_entry	**entryp;
 	const struct cmd_entry	 *entry;
 	struct format_tree	 *ft;
@@ -329,7 +331,7 @@ cmd_list_keys_commands(struct cmd *self, struct cmdq_item *item)
 		    "#{command_list_usage}";
 	}
 
-	ft = format_create(item->client, item, FORMAT_NONE, 0);
+	ft = format_create(cmdq_get_client(item), item, FORMAT_NONE, 0);
 	format_defaults(ft, NULL, NULL, NULL, NULL);
 
 	for (entryp = cmd_table; *entryp != NULL; entryp++) {

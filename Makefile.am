@@ -12,8 +12,8 @@ dist_EXTRA_tmux_SOURCES = compat/*.[ch]
 
 # Preprocessor flags.
 AM_CPPFLAGS += @XOPEN_DEFINES@ \
-	-DTMUX_VERSION="\"@VERSION@\"" \
-	-DTMUX_CONF="\"$(sysconfdir)/tmux.conf:~/.tmux.conf:~/.config/tmux/tmux.conf\""
+	-DTMUX_VERSION='"@VERSION@"' \
+	-DTMUX_CONF='"$(sysconfdir)/tmux.conf:~/.tmux.conf:$$XDG_CONFIG_HOME/tmux/tmux.conf:~/.config/tmux/tmux.conf"'
 
 # Additional object files.
 LDADD = $(LIBOBJS)
@@ -171,6 +171,7 @@ dist_tmux_SOURCES = \
 	tmux.c \
 	tmux.h \
 	tty-acs.c \
+	tty-features.c \
 	tty-keys.c \
 	tty-term.c \
 	tty.c \
@@ -179,6 +180,7 @@ dist_tmux_SOURCES = \
 	window-client.c \
 	window-clock.c \
 	window-copy.c \
+	window-customize.c \
 	window-tree.c \
 	window.c \
 	xmalloc.c \
